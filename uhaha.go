@@ -36,7 +36,6 @@ import (
 	"github.com/tidwall/match"
 	"github.com/tidwall/redcon"
 	"github.com/tidwall/redlog/v2"
-	"github.com/tidwall/rtime"
 
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
 	raftleveldb "github.com/tidwall/raft-leveldb"
@@ -51,7 +50,6 @@ func Main(conf Config) {
 	conf.AddService(redisService())
 
 	hclogger, log := logInit(conf)
-	tm := remoteTimeInit(conf, log)
 	dir, data := dataDirInit(conf, log)
 	m := machineInit(conf, dir, data, log)
 	tlscfg := tlsInit(conf, log)
@@ -67,6 +65,8 @@ func Main(conf Config) {
 	go runMaintainServers(ra)
 	go runWriteApplier(conf, m, ra)
 	go runLogLoadedPoller(conf, m, ra, tlscfg, log)
+
+	tm := new(remoteTime)
 	go runTicker(conf, tm, m, ra, log)
 
 	log.Fatal(svr.serve())
@@ -718,56 +718,6 @@ func (rt *remoteTime) Now() time.Time {
 	}
 	rt.mu.Unlock()
 	return ctime
-}
-
-// remoteTimeInit initializes the remote time fetching services, and
-// continueously runs it in the background to keep synchronized.
-func remoteTimeInit(conf Config, log *redlog.Logger) *remoteTime {
-	rt := new(remoteTime)
-	if conf.LocalTime {
-		log.Warning("using local time")
-		return rt
-	}
-	var wg sync.WaitGroup
-	var once int32
-	wg.Add(1)
-	go func() {
-		for {
-			tm := rtime.Now()
-			if tm.IsZero() {
-				time.Sleep(time.Second)
-				continue
-			}
-			rt.mu.Lock()
-			if tm.After(rt.rtime) {
-				rt.ltime = time.Now()
-				rt.rtime = tm
-				log.Debugf("synchronized time: %s", rt.rtime)
-				if atomic.LoadInt32(&once) == 0 {
-					atomic.StoreInt32(&once, 1)
-					wg.Done()
-				}
-			}
-			rt.mu.Unlock()
-			time.Sleep(time.Second * 30)
-		}
-	}()
-	go func() {
-		time.Sleep(time.Second * 2)
-		if atomic.LoadInt32(&once) != 0 {
-			return
-		}
-		for {
-			log.Warning("synchronized time: waiting for internet connection")
-			if atomic.LoadInt32(&once) != 0 {
-				break
-			}
-			time.Sleep(time.Second * 5)
-		}
-	}()
-	wg.Wait()
-	log.Printf("synchronized time")
-	return rt
 }
 
 func raftInit(conf Config, hclogger hclog.Logger, fsm raft.FSM,

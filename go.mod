@@ -14,7 +14,6 @@ require (
 	github.com/tidwall/redcon v1.4.5
 	github.com/tidwall/redlog/v2 v2.0.4
 	github.com/tidwall/rhh v1.3.0
-	github.com/tidwall/rtime v0.2.0
 	github.com/tidwall/sds v0.1.1
 )
 
