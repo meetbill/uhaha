@@ -18,7 +18,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"os"
 	"path/filepath"
@@ -196,6 +195,16 @@ type Config struct {
 	// prior to send into a client connection.
 	ResponseFilter ResponseFilter
 
+	// StateChange is an optional callback function that fires when the raft
+	// state has changed.
+	StateChange func(state State)
+
+	// LocalConnector is an optional callback function that returns a new
+	// connector that allows for establishing "local" connections through
+	// the Redis protocol. A local connection bypasses the network and
+	// communicates directly with this server, though the same process.
+	LocalConnector func(lconn LocalConnector)
+
 	LocalTime   bool          // default false
 	TickDelay   time.Duration // default 200ms
 	BackupPath  string        // default ""
@@ -218,13 +227,46 @@ type Config struct {
 	InitRunQuit bool          // default false
 }
 
+// State captures the state of a Raft node: Follower, Candidate, Leader,
+// or Shutdown.
+type State byte
+
+const (
+	// Follower is the initial state of a Raft node.
+	Follower State = iota
+
+	// Candidate is one of the valid states of a Raft node.
+	Candidate
+
+	// Leader is one of the valid states of a Raft node.
+	Leader
+
+	// Shutdown is the terminal state of a Raft node.
+	Shutdown
+)
+
+func (state State) String() string {
+	switch state {
+	case Follower:
+		return "Follower"
+	case Candidate:
+		return "Candidate"
+	case Leader:
+		return "Leader"
+	case Shutdown:
+		return "Shutdown"
+	default:
+		return "Unknown"
+	}
+}
+
 // The Backend database format used for storing Raft logs and meta data.
 type Backend int
 
 const (
 	// LevelDB is an on-disk LSM (LSM log-structured merge-tree) database. This
-	// format is optimized for fast sequential reads and writes, which is ideal
-	// for most Raft implementations. This is the default format used by Uhaha.
+	// format is optimized for fast sequential writes, which is ideal for most
+	// Raft implementations. This is the default format used by Uhaha.
 	LevelDB Backend = iota
 	// Bolt is an on-disk single-file b+tree database. This format has been a
 	// popular choice for Go-based Raft implementations for years.
@@ -465,7 +507,7 @@ func jsonSnapshot(data interface{}) (Snapshot, error) {
 }
 
 func jsonRestore(rd io.Reader, typ reflect.Type) (interface{}, error) {
-	jsdata, err := ioutil.ReadAll(rd)
+	jsdata, err := io.ReadAll(rd)
 	if err != nil {
 		return nil, err
 	}
@@ -509,7 +551,7 @@ func logInit(conf Config) (hclog.Logger, *redlog.Logger) {
 		lopts.Level = 3
 	case "quiet", "silent":
 		lopts.Level = 3
-		wr = ioutil.Discard
+		wr = io.Discard
 	default:
 		fmt.Fprintf(os.Stderr, "invalid -loglevel: %s\n", logLevel)
 		os.Exit(1)
@@ -527,17 +569,13 @@ func logInit(conf Config) (hclog.Logger, *redlog.Logger) {
 
 func stateChangeFilter(line string, log *redlog.Logger) string {
 	if strings.Contains(line, "entering ") {
-		app := log.App()
 		if strings.Contains(line, "entering candidate state") {
-			app = 'C'
+			log.SetApp('C')
 		} else if strings.Contains(line, "entering follower state") {
-			app = 'F'
+			log.SetApp('F')
 		} else if strings.Contains(line, "entering leader state") {
-			app = 'L'
-		} else {
-			return line
+			log.SetApp('L')
 		}
-		log.SetApp(app)
 	}
 	return line
 }
@@ -730,6 +768,30 @@ func raftInit(conf Config, hclogger hclog.Logger, fsm raft.FSM,
 	ra, err := raft.NewRaft(rconf, fsm, logStore, stableStore, snaps, trans)
 	if err != nil {
 		log.Fatal(err)
+	}
+	if conf.StateChange != nil {
+		// monitor the state changes.
+		lstate := raft.Shutdown
+		conf.StateChange(Shutdown)
+		go func() {
+			for {
+				state := ra.State()
+				if state != lstate {
+					lstate = state
+					switch state {
+					case raft.Candidate:
+						conf.StateChange(Candidate)
+					case raft.Follower:
+						conf.StateChange(Follower)
+					case raft.Leader:
+						conf.StateChange(Leader)
+					case raft.Shutdown:
+						conf.StateChange(Shutdown)
+					}
+				}
+				time.Sleep(time.Second / 4)
+			}
+		}()
 	}
 	return &raftWrap{
 		Raft:      ra,
@@ -1841,6 +1903,22 @@ func (m *machine) Uint64() uint64 {
 	return (uint64(m.Uint32()) << 32) | uint64(m.Uint32())
 }
 
+const hexchars = "0123456789abcdef"
+
+func (m *machine) UUID() string {
+	var buf [36]byte
+	m.Read(buf[:])
+	for i := 0; i < len(buf); i++ {
+		buf[i] = hexchars[buf[i]&15]
+	}
+	buf[8] = '-'
+	buf[13] = '-'
+	buf[14] = '4'
+	buf[18] = '-'
+	buf[23] = '-'
+	return string(buf[:])
+}
+
 func (m *machine) Int() int {
 	return int(m.Uint64() << 1 >> 1)
 }
@@ -1877,6 +1955,7 @@ type Rand interface {
 	Uint32() uint32
 	Float64() float64
 	Read([]byte) (n int, err error)
+	UUID() string
 }
 
 // #region -- pcg-family random number generator
@@ -1964,8 +2043,8 @@ func WriteRawMachineInfo(m Machine, info *RawMachineInfo) {
 
 // BARRIER
 // help: barrier is a noop that saves to the raft log. It can be used to
-//       ensure that the current server is the leader and that the cluster
-//       is working.
+// ensure that the current server is the leader and that the cluster
+// is working.
 func cmdBARRIER(um Machine, ra *raftWrap, args []string) (interface{}, error) {
 	if len(args) != 1 {
 		return nil, ErrWrongNumArgs
@@ -1975,8 +2054,8 @@ func cmdBARRIER(um Machine, ra *raftWrap, args []string) (interface{}, error) {
 
 // TICK timestamp-int64 random-int64
 // help: updates the machine timestamp and random seed. It's not possible to
-//       directly call this from a client service. It can only be called by
-//       its own internal server instance.
+// directly call this from a client service. It can only be called by
+// its own internal server instance.
 func cmdTICK(um Machine, ra *raftWrap, args []string) (interface{}, error) {
 	m := getBaseMachine(um)
 	if m == nil {
@@ -2199,7 +2278,7 @@ func cmdRAFTSNAPSHOT(um Machine, ra *raftWrap, args []string,
 
 // RAFT SNAPSHOT NOW
 // help: takes a snapshot of the data and returns information relating to the
-//       resulting snapshot; map[string]string
+// resulting snapshot; map[string]string
 func cmdRAFTSNAPSHOTNOW(m *machine, ra *raftWrap, args []string,
 ) (interface{}, error) {
 	if len(args) != 3 {
@@ -2313,7 +2392,7 @@ func cmdRAFTSNAPSHOTREAD(m *machine, ra *raftWrap, args []string,
 	defer f.Close()
 	var bytes []byte
 	if allBytes {
-		bytes, err = ioutil.ReadAll(f)
+		bytes, err = io.ReadAll(f)
 		if err != nil {
 			return nil, err
 		}
@@ -2786,16 +2865,17 @@ func (s *service) Auth(auth string) error {
 // The Send function sends command args to the service and return a future
 // receiver for getting the response.
 // There are three type of commands: write, read, and system.
-// - Write commands always go though the raft log one at a time.
-// - Read commands do not go though the raft log but do need to be executed
-//   on the leader. Many reads from multiple clients can execute at the same
-//   time, but each read must wait until the leader has applied at least one
-//   new tick (which acts as a barrier) and must wait for any pending writes
-//   that the same client has issued to be fully applied before executing the
-//   read.
-// - System commands run independently from the machine or user data space, and
-//   are primarily used for executing lower level system operations such as
-//   Raft functions, backups, server stats, etc.
+//
+//   - Write commands always go though the raft log one at a time.
+//   - Read commands do not go though the raft log but do need to be executed
+//     on the leader. Many reads from multiple clients can execute at the same
+//     time, but each read must wait until the leader has applied at least one
+//     new tick (which acts as a barrier) and must wait for any pending writes
+//     that the same client has issued to be fully applied before executing the
+//     read.
+//   - System commands run independently from the machine or user data space, and
+//     are primarily used for executing lower level system operations such as
+//     Raft functions, backups, server stats, etc.
 //
 // ** Open Reads **
 // When the server has been started with the --openreads flag or when
@@ -3130,38 +3210,46 @@ func redisConnWriteAny(
 }
 
 func redisServiceHandler(s Service, ln net.Listener) {
-	s.Log().Fatal(redcon.Serve(ln,
-		// handle commands
-		func(conn redcon.Conn, cmd redcon.Command) {
-			client := conn.Context().(*redisClient)
-			var args [][]string
+	accept := func(conn redcon.Conn) bool {
+		context, accept := s.Opened(conn.RemoteAddr())
+		if !accept {
+			return false
+		}
+		client := new(redisClient)
+		client.opts.From = client
+		client.opts.Context = context
+		conn.SetContext(client)
+		return true
+	}
+	closed := func(conn redcon.Conn, err error) {
+		if conn.Context() == nil {
+			return
+		}
+		client := conn.Context().(*redisClient)
+		s.Closed(client.opts.Context, conn.RemoteAddr())
+	}
+	handle := func(conn redcon.Conn, cmd redcon.Command) {
+		client := conn.Context().(*redisClient)
+		var args [][]string
+		args = append(args, redisCommandToArgs(cmd))
+		for _, cmd := range conn.ReadPipeline() {
 			args = append(args, redisCommandToArgs(cmd))
-			for _, cmd := range conn.ReadPipeline() {
-				args = append(args, redisCommandToArgs(cmd))
-			}
-			redisServiceExecArgs(s, client, conn, args)
-		},
-		// handle opened connection
-		func(conn redcon.Conn) bool {
-			context, accept := s.Opened(conn.RemoteAddr())
-			if !accept {
-				return false
-			}
-			client := new(redisClient)
-			client.opts.From = client
-			client.opts.Context = context
-			conn.SetContext(client)
-			return true
-		},
-		// handle closed connection
-		func(conn redcon.Conn, err error) {
-			if conn.Context() == nil {
-				return
-			}
-			client := conn.Context().(*redisClient)
-			s.Closed(client.opts.Context, conn.RemoteAddr())
-		}),
-	)
+		}
+		redisServiceExecArgs(s, client, conn, args)
+	}
+
+	if s, ok := s.(*service); ok {
+		if s.ra.conf.LocalConnector != nil {
+			s.ra.conf.LocalConnector(&localRedisConnector{
+				auth:   s.ra.conf.Auth,
+				accept: accept,
+				closed: closed,
+				handle: handle,
+			})
+		}
+	}
+
+	s.Log().Fatal(redcon.Serve(ln, handle, accept, closed))
 }
 
 // FilterArgs ...
@@ -3254,4 +3342,107 @@ func (conn *redisHijackConn) ReadCommand() (args []string, err error) {
 		return false
 	})
 	return args, err
+}
+
+type LocalConnector interface {
+	Open() (LocalConn, error)
+}
+
+type localRedisConnector struct {
+	auth   string
+	accept func(conn redcon.Conn) bool
+	closed func(conn redcon.Conn, err error)
+	handle func(conn redcon.Conn, cmd redcon.Command)
+}
+
+type LocalConn interface {
+	Do(args ...string) redcon.RESP
+	Close()
+}
+
+func (lc *localRedisConnector) Open() (LocalConn, error) {
+	conn := &localRedisConn{lc: lc}
+	conn.rc = &localRedconConn{conn: conn}
+	if !conn.lc.accept(conn.rc) {
+		return nil, errors.New("not accepted")
+	}
+	conn.Do("auth", lc.auth)
+	return conn, nil
+}
+
+type localRedisConn struct {
+	lc *localRedisConnector
+	rc *localRedconConn
+}
+
+func (conn *localRedisConn) Close() {
+	conn.lc.closed(conn.rc, nil)
+}
+
+func (conn *localRedisConn) Do(args ...string) redcon.RESP {
+	var cmd redcon.Command
+	cmd.Args = make([][]byte, len(args))
+	raw := redcon.AppendArray(nil, len(args))
+	for i := 0; i < len(args); i++ {
+		raw = redcon.AppendBulkString(raw, args[i])
+		cmd.Args[i] = []byte(args[i])
+	}
+	cmd.Raw = raw
+	conn.lc.handle(conn.rc, cmd)
+	var resp redcon.RESP
+	if len(conn.rc.out) > 0 {
+		_, resp = redcon.ReadNextRESP(conn.rc.out)
+		conn.rc.out = nil
+	}
+	return resp
+}
+
+type localRedconConn struct {
+	ctx  interface{}
+	out  []byte
+	conn *localRedisConn
+}
+
+func (c *localRedconConn) Close() error                   { return nil }
+func (c *localRedconConn) Context() interface{}           { return c.ctx }
+func (c *localRedconConn) SetContext(v interface{})       { c.ctx = v }
+func (c *localRedconConn) SetReadBuffer(n int)            {}
+func (c *localRedconConn) RemoteAddr() string             { return "" }
+func (c *localRedconConn) ReadPipeline() []redcon.Command { return nil }
+func (c *localRedconConn) PeekPipeline() []redcon.Command { return nil }
+func (c *localRedconConn) NetConn() net.Conn              { return nil }
+func (c *localRedconConn) Detach() redcon.DetachedConn    { return nil }
+
+func (c *localRedconConn) WriteString(str string) {
+	c.out = redcon.AppendString(c.out, str)
+}
+func (c *localRedconConn) WriteBulk(bulk []byte) {
+	c.out = redcon.AppendBulk(c.out, bulk)
+}
+func (c *localRedconConn) WriteBulkString(bulk string) {
+	c.out = redcon.AppendBulkString(c.out, bulk)
+}
+func (c *localRedconConn) WriteInt(num int) {
+	c.out = redcon.AppendInt(c.out, int64(num))
+}
+func (c *localRedconConn) WriteInt64(num int64) {
+	c.out = redcon.AppendInt(c.out, num)
+}
+func (c *localRedconConn) WriteUint64(num uint64) {
+	c.out = redcon.AppendUint(c.out, num)
+}
+func (c *localRedconConn) WriteError(msg string) {
+	c.out = redcon.AppendError(c.out, msg)
+}
+func (c *localRedconConn) WriteArray(count int) {
+	c.out = redcon.AppendArray(c.out, count)
+}
+func (c *localRedconConn) WriteNull() {
+	c.out = redcon.AppendNull(c.out)
+}
+func (c *localRedconConn) WriteRaw(data []byte) {
+	c.out = append(c.out, data...)
+}
+func (c *localRedconConn) WriteAny(v interface{}) {
+	c.out = redcon.AppendAny(c.out, v)
 }
