@@ -3173,6 +3173,8 @@ func redisServiceExecArgs(s Service, client *redisClient, conn redcon.Conn,
 			case Hijack:
 				conn := newRedisHijackedConn(conn.Detach())
 				go v(s, conn)
+			case Pubsub:
+				v(s, conn, args[0])
 			case redisQuitClose:
 				v2 := redcon.SimpleString("OK")
 				redisConnWriteAny(sname, rfilt, conn, client, r.Args(), v2)
@@ -3260,6 +3262,9 @@ type FilterArgs []string
 // network loop. An example of it's usage can be found in the examples/kvdb
 // project.
 type Hijack func(s Service, conn HijackedConn)
+
+// for pubsub
+type Pubsub func(s Service, conn redcon.Conn, args []string)
 
 // HijackedConn is a connection that has been detached from the main service
 // network loop. It's entirely up to the hijacker to performs all I/O
